@@ -23,18 +23,20 @@ import os
 import re
 import sys
 import threading
+import urllib.error
 import urllib.request
 from collections import Counter
 from ctypes import wintypes
 from html import escape
-from urllib.parse import quote, unquote, urljoin
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QActionGroup, QColor, QFont, QGuiApplication, QIcon,
                            QKeySequence, QPainter, QPalette, QPen, QPixmap,
                            QShortcut, QTextCharFormat, QTextCursor)
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkProxy, QNetworkReply,
+                               QNetworkRequest)
 from PySide6.QtWidgets import (QApplication, QFileDialog, QFrame, QLabel, QLineEdit,
                                QMenu, QSystemTrayIcon, QTextBrowser, QWidget)
 
@@ -60,6 +62,7 @@ DEFAULT_CONF = {
     "bookmarks": [],
     "outline": False,
     "preload": True,
+    "net_direct": False,      # True = 总是直连（绕过系统代理 / VPN）
 }
 
 COLORS = ["#111111", "#f2f2f2", "#7bd88f"]
@@ -81,6 +84,8 @@ def load_conf():
             conf.update(json.load(f))
     except Exception:
         pass
+    global NET_DIRECT
+    NET_DIRECT = bool(conf.get("net_direct", False))
     return conf
 
 
@@ -317,20 +322,100 @@ def has_obf(text):
     return any(ord(c) >= OBF_MIN for c in text)
 
 
+# --------------------------------------------------------------------------- #
+# 网络通道：系统代理 ↔ 直连
+#
+# PySide6/Qt6 默认跟随系统代理（QNetworkProxyFactory.usesSystemConfiguration()
+# 就是 True），urllib 也会读注册表里的代理设置。挂着 VPN / Clash 的时候，很多
+# 国内站点挂在 Cloudflare 后面，会把代理出口 IP 判为可疑，直接回 403 +
+# "Just a moment..." 的 JS 挑战页 —— 这种页必须执行 JS 才能过，纯 HTTP 抓取
+# 永远过不去，表现就是“以前能看，开了 VPN 就打不开”。
+#
+# 策略：先按系统代理发请求；一旦被挑战页拦下，立刻改走直连重试一次，
+# 并按域名记住哪个通道能通，后续请求直接走对的那个（避免每次都双重请求）。
+# --------------------------------------------------------------------------- #
+NET_DIRECT = False      # 右键菜单「总是直连」开关
+_direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_route = {}             # host -> "direct" / "proxy"
+_route_lock = threading.Lock()
+
+
+def _host_of(url):
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def is_challenge(data, code=0):
+    """响应是不是 Cloudflare / WAF 的 JS 挑战页（而不是真页面）。"""
+    if code in (403, 429, 503):
+        return True
+    if not data:
+        return False
+    return b"just a moment" in bytes(data[:8192]).lower()
+
+
+def route_of(url):
+    """这个 url 该走哪个通道："direct" / "proxy" / None（还没探到）。"""
+    if NET_DIRECT:
+        return "direct"
+    with _route_lock:
+        return _route.get(_host_of(url))
+
+
+def set_route(url, mode):
+    host = _host_of(url)
+    if host:
+        with _route_lock:
+            _route[host] = mode
+
+
+def _urlopen(req, url, timeout, direct):
+    if direct:
+        return _direct_opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _fetch(url, headers, timeout, retry, raw):
+    """先系统代理、被拦住就直连；成功一次后记住这个域名的通道。"""
+    prefer_direct = route_of(url) == "direct"
+    last = RuntimeError("请求失败")
+    for direct in ([True, False] if prefer_direct else [False, True]):
+        for _ in range(retry + 1):
+            try:
+                resp = _urlopen(urllib.request.Request(url, headers=headers),
+                                url, timeout, direct)
+                data = resp.read()
+                if not direct and is_challenge(data):
+                    last = RuntimeError("被 Cloudflare 挑战页拦截")
+                    break          # 换直连再试
+                set_route(url, "direct" if direct else "proxy")
+                if raw:
+                    return data
+                return decode_body(
+                    data, resp.headers.get("Content-Type", ""))
+            except urllib.error.HTTPError as ex:
+                body = b""
+                try:
+                    body = ex.read(2048)
+                except Exception:
+                    pass
+                last = ex
+                if not direct and is_challenge(body, ex.code):
+                    break          # 换直连再试
+            except Exception as ex:
+                last = ex
+    raise last
+
+
 def fetch_bytes(url, referer=None, timeout=20, retry=1):
     headers = {"User-Agent": UA,
                "Accept-Language": "zh-CN,zh;q=0.9",
                "Accept": "*/*"}
     if referer:
         headers["Referer"] = referer
-    last = None
-    for _ in range(retry + 1):
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            return urllib.request.urlopen(req, timeout=timeout).read()
-        except Exception as ex:
-            last = ex
-    raise last
+    return _fetch(url, headers, timeout, retry, True)
 
 
 def fetch_text(url, referer=None, timeout=20, retry=1):
@@ -340,15 +425,7 @@ def fetch_text(url, referer=None, timeout=20, retry=1):
                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
     if referer:
         headers["Referer"] = referer
-    last = None
-    for _ in range(retry + 1):
-        try:
-            resp = urllib.request.urlopen(
-                urllib.request.Request(url, headers=headers), timeout=timeout)
-            return decode_body(resp.read(), resp.headers.get("Content-Type", ""))
-        except Exception as ex:
-            last = ex
-    raise last
+    return _fetch(url, headers, timeout, retry, False)
 
 
 def parse_font_map(data):
@@ -748,6 +825,12 @@ class MainWindow(QWidget):
 
         self.nam = QNetworkAccessManager(self)
         self.nam.finished.connect(self.on_reply)
+        # 强制直连的备用通道：系统代理被 Cloudflare 拦住时用它重试
+        self.nam_direct = QNetworkAccessManager(self)
+        self.nam_direct.setProxy(
+            QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
+        self.nam_direct.finished.connect(self.on_reply)
+        self._request_direct = False
 
         x, y, w, h = self._clamped_geometry()
         self.setGeometry(x, y, w, h)
@@ -830,6 +913,10 @@ class MainWindow(QWidget):
         self.render()
         self.toast("加载中…", 8000)
 
+        self._get(url, route_of(url) == "direct")
+
+    def _get(self, url, direct=False):
+        """发一次 GET；direct=True 时强制绕过系统代理。"""
         req = QNetworkRequest(QUrl(url))
         req.setHeader(QNetworkRequest.KnownHeaders.UserAgentHeader, UA)
         req.setRawHeader(b"Accept-Language", b"zh-CN,zh;q=0.9,en;q=0.8")
@@ -841,7 +928,9 @@ class MainWindow(QWidget):
                 QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
         except Exception:
             pass
-        self.reply = self.nam.get(req)
+        self._request_direct = direct
+        nam = self.nam_direct if direct else self.nam
+        self.reply = nam.get(req)
 
     def on_reply(self, reply):
         if reply is not self.reply:
@@ -849,16 +938,36 @@ class MainWindow(QWidget):
             return
         url = reply.url().toString()
         err = reply.error()
+        code = reply.attribute(
+            QNetworkRequest.Attribute.HttpStatusCodeAttribute) or 0
+        data = bytes(reply.readAll())
+        ctype = reply.header(QNetworkRequest.KnownHeaders.ContentTypeHeader)
+        reply.deleteLater()
+
+        # 挂在 Cloudflare 后面的站会把 VPN 出口 IP 判为可疑，返回
+        # 403 + "Just a moment..." 挑战页（需要跑 JS 才能过）。纯 HTTP 抓不下来，
+        # 这时改走直连再试一次 —— 国内站一般直连就正常了。
+        proxy_broken = err != QNetworkReply.NetworkError.NoError and err in (
+            QNetworkReply.NetworkError.ProxyConnectionRefusedError,
+            QNetworkReply.NetworkError.ProxyConnectionClosedError,
+            QNetworkReply.NetworkError.ProxyNotFoundError,
+            QNetworkReply.NetworkError.ProxyTimeoutError,
+            QNetworkReply.NetworkError.ProxyAuthenticationRequiredError,
+            QNetworkReply.NetworkError.ContentAccessDenied,
+            QNetworkReply.NetworkError.UnknownContentError,
+        )
+        if not self._request_direct and (proxy_broken or is_challenge(data, int(code))):
+            set_route(url, "direct")
+            self.toast("代理被拦截，改直连重试…", 4000)
+            QTimer.singleShot(80, lambda: self._get(url, True))
+            return
+
         if err != QNetworkReply.NetworkError.NoError:
             self.page = {"url": url, "title": "打开失败",
                          "lines": [str(reply.errorString()), url], "nav": []}
             self.render()
             self.toast("打开失败")
-            reply.deleteLater()
             return
-        ctype = reply.header(QNetworkRequest.KnownHeaders.ContentTypeHeader)
-        data = bytes(reply.readAll())
-        reply.deleteLater()
         try:
             html = decode_body(data, str(ctype))
             title, lines, nav = extract(html, url)
@@ -1312,10 +1421,36 @@ class MainWindow(QWidget):
         m.addAction("字号 -    Ctrl+-", lambda: self.zoom_by(-1))
         m.addAction("字号复位    Ctrl+0", self.zoom_reset)
         m.addAction("滚动手感（细腻/标准/快速）", self.cycle_scroll)
+        nm = m.addMenu("网络通道")
+        nm.setStyleSheet(MENU_QSS)
+        grp = QActionGroup(nm)
+        now_direct = bool(self.conf.get("net_direct", False))
+        for label, direct in (("跟随系统代理（默认）", False),
+                              ("总是直连（绕过 VPN）", True)):
+            act = nm.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(now_direct == direct)
+            act.triggered.connect(
+                lambda _=False, d=direct: self.set_net_mode(d))
+            grp.addAction(act)
         m.addSeparator()
         m.addAction("隐藏窗口    Ctrl+H", self.hide)
         m.addAction("退出    Ctrl+Q", self.quit)
         m.exec(gpos)
+
+    def set_net_mode(self, direct):
+        """切换网络通道：跟随系统代理 / 总是直连。"""
+        global NET_DIRECT
+        NET_DIRECT = bool(direct)
+        self.conf["net_direct"] = bool(direct)
+        save_conf(self.conf)
+        with _route_lock:
+            _route.clear()
+        self.toast("网络通道：总是直连" if direct
+                   else "网络通道：跟随系统代理", 2500)
+        url = (self.page or {}).get("url", "")
+        if url.startswith("http"):
+            self.open_url(url, push=False)
 
     def is_bookmarked(self):
         page = self.page or {}
