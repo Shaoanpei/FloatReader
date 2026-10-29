@@ -1,0 +1,32 @@
+# ===== 个人运行时配置（含阅读地址、书签，勿公开） =====
+config.json
+config.*.json
+
+# ===== 日志 =====
+*.log
+err.log
+out.log
+
+# ===== PyInstaller 构建产物 =====
+build/
+dist/
+*.manifest
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ===== 开发调试截图 =====
+dev/*.png
+dev/*.jpg
+dev/*.jpeg
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
