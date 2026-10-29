@@ -111,12 +111,30 @@ DROP_TAGS = ["script", "style", "noscript", "iframe", "svg", "img", "header",
 # 常见小说站 / 新闻站的正文容器
 CONTENT_SELECTORS = [
     "#content", "#chaptercontent", "#chapterContent", "#chapter-content",
+    "#novelcontent", ".novelcontent",
     "#booktext", "#nr", "#artibody", "#htmlContent", "#article", "#mainText",
     ".content", ".chapter-content", ".reading-content", ".article-content",
     ".art-content", ".txt", "article", ".article",
 ]
 
-NAV_WORDS = ("下一", "后一", "目录", "返回", "下一章", "下一节", "下一页")
+# 「下一章 / 下一页」的写法很杂：有用繁体的（頁），也有 "下 頁" 这种夹空白的。
+# 匹配前会先去掉所有空白，所以这里只列字面形式。
+NAV_WORDS = ("下一", "下頁", "下页", "后一", "後一", "後頁", "后页",
+             "下一章", "下一節", "下一节", "下一頁", "下一页",
+             "目录", "目錄", "返回")
+NEXT_WORDS = ("下一", "下頁", "下页", "后一", "後一", "後頁", "后页")
+
+# 有的站把链接文字里的「一」换成破折号「—」(U+2014) 来混淆：视觉上差不多，
+# 但字符串比对全废 —— "下一页" ≠ "下—页"，导致翻章链接全部识别不出来。
+# 正文里的「——」是正常中文破折号，所以只在链接文字上做还原。
+LOOKALIKE = str.maketrans({"\u2010": "一", "\u2011": "一", "\u2012": "一",
+                           "\u2013": "一", "\u2014": "一", "\u2015": "一",
+                           "\u2500": "一", "\uff0d": "一"})
+
+
+def fix_lookalike(text):
+    """把链接文字里冒充「一」的破折号 / 横线还原成「一」。"""
+    return text.translate(LOOKALIKE)
 
 
 def decode_body(data, content_type):
@@ -158,11 +176,16 @@ def pick_main_node(soup):
             if s > best_score:
                 best, best_score = el, s
     for el in soup.find_all(["div", "article", "section", "td"]):
-        if el.find(["div", "article", "section"]):
-            continue
         s = text_score(el)
-        if s > best_score:
-            best, best_score = el, s
+        if s <= best_score:
+            continue
+        # 不能简单地只认“叶子容器”：很多站的正文里还嵌着分页小 div，
+        # 那样会把整个正文容器跳掉。改成看内层：内层得分和外层差不多，
+        # 说明外层只是包了一层导航，选内层；内层得分远低于自己才是真正文。
+        kids = el.find_all(["div", "article", "section"])
+        if kids and max(text_score(k) for k in kids) > s * 0.9:
+            continue
+        best, best_score = el, s
     return best
 
 
@@ -195,7 +218,8 @@ def extract_lines(node, base_url):
                 if name == "br":
                     flush()
                 elif name == "a":
-                    txt = re.sub(r"\s+", " ", child.get_text(" ", strip=True))
+                    txt = fix_lookalike(
+                        re.sub(r"\s+", " ", child.get_text(" ", strip=True)))
                     if not txt:
                         continue
                     href = child.get("href", "")
@@ -271,7 +295,9 @@ def extract(html, base_url):
     # 先抓"下一页 / 目录"这类链接，再清掉干扰标签
     nav, seen = [], set()
     for a in soup.find_all("a", href=True):
-        txt = a.get_text(strip=True)
+        # 不少站写成 "目&nbsp;录" / "下 頁"，夹着空白会让关键词匹配全部失效，
+        # 所以先去掉所有空白（含 \xa0 全角空格）再比对；顺带还原冒充「一」的破折号。
+        txt = fix_lookalike(re.sub(r"[\s\u3000\xa0]+", "", a.get_text()))
         if not txt or len(txt) > 12:
             continue
         if any(w in txt for w in NAV_WORDS):
@@ -517,6 +543,7 @@ class Prefetcher(QObject):
             html = fetch_text(url)
             title, lines, nav = extract(html, url)
             if not lines:
+                self.ready.emit(url, None)     # 告诉主线程清掉 prefetching
                 return
             if has_obf("".join(lines)):
                 mapping, _err = build_font_map(html, url)
@@ -525,7 +552,9 @@ class Prefetcher(QObject):
             self.ready.emit(url, {"url": url, "title": title,
                                   "lines": lines, "nav": nav})
         except Exception:
-            pass          # 预取失败就算了，真正点的时候再走正常加载
+            # 预取失败就算了，真正点的时候再走正常加载；
+            # 但也必须 emit，否则这个 url 会永远卡在 prefetching 里。
+            self.ready.emit(url, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -1114,7 +1143,7 @@ class MainWindow(QWidget):
         """返回“下一章/下一节/下一页”的地址。"""
         nav = (self.page or {}).get("nav") or []
         for txt, href in nav:
-            if "下一" in txt or "后一" in txt:
+            if any(w in txt for w in NEXT_WORDS):
                 return href
         return nav[0][1] if nav else None
 
@@ -1130,7 +1159,10 @@ class MainWindow(QWidget):
         """后台预取下一章（含字体反爬还原），点的时候直接用缓存。"""
         if not self.conf.get("preload", True):
             return
-        url = self.next_target()
+        # 只预取明确的「下一章 / 下一页」；如果页面只有「目录 / 返回书页」，
+        # 不要用 nav[0] 兜底 —— 那会把目录页当下一章抓回来，白费流量还占缓存。
+        nav = (self.page or {}).get("nav") or []
+        url = next((h for t, h in nav if any(w in t for w in NEXT_WORDS)), None)
         if not url or url.startswith("txt://"):
             return
         if url in self.cache or url in self.prefetching:
